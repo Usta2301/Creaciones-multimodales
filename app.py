@@ -7,37 +7,49 @@ import mediapipe as mp
 import paho.mqtt.client as mqtt
 import atexit
 
-# Initialize MediaPipe Hands
+# Title
+st.title("Detector de Gestos con MQTT 🖐✊👌")
+
+# Initialize MediaPipe Hands with dynamic mode for video
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
-if "hands" not in st.session_state:
-    st.session_state.hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1, min_detection_confidence=0.7)
 
-# MQTT
+if "hands" not in st.session_state:
+    # Use static_image_mode=False for continuous video frames
+    st.session_state.hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5
+    )
+
+# MQTT setup
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_TOPIC = "streamlit/gesto"
 if "mqtt_client" not in st.session_state:
-    st.session_state.mqtt_client = mqtt.Client()
-    st.session_state.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client = mqtt.Client()
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    st.session_state.mqtt_client = client
+    # Ensure MQTT disconnect on exit
+    atexit.register(client.disconnect)
 
-# Clean up resources on exit
-atexit.register(st.session_state.hands.close)
-atexit.register(st.session_state.mqtt_client.disconnect)
+# Gesture detection
 
 def detectar_gesto(landmarks):
     dedos_estirados = []
-    tips_ids = [4, 8, 12, 16, 20]
-
-    # Pulgar (eje X)
+    # IDs of landmark tips
+    # Thumb (x-axis), Others (y-axis)
     dedos_estirados.append(landmarks[4][0] > landmarks[3][0])
+    for idx in [8, 12, 16, 20]:
+        dedos_estirados.append(landmarks[idx][1] < landmarks[idx - 2][1])
 
-    # Otros dedos (eje Y)
-    for i in [8, 12, 16, 20]:
-        dedos_estirados.append(landmarks[i][1] < landmarks[i - 2][1])
+    # Check for OK gesture by distance thumb-index
+    dist = np.linalg.norm(
+        np.array(landmarks[4][:2]) - np.array(landmarks[8][:2])
+    )
 
-    # Distance calculation for OK gesture
-    dist = np.sqrt((landmarks[4][0] - landmarks[8][0])**2 + (landmarks[4][1] - landmarks[8][1])**2)
+    # Determine gesture
     if dedos_estirados == [False] * 5:
         return "Puño cerrado ✊"
     elif dedos_estirados == [True] * 5:
@@ -46,23 +58,27 @@ def detectar_gesto(landmarks):
         return "Gesto OK 👌"
     return None
 
+# Callback for each video frame
 frame_counter = 0
 last_gesture = None
+
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     global frame_counter, last_gesture
     frame_counter += 1
-    if frame_counter % 2 != 0:  # Process every 2nd frame
+    # Process every other frame to save resources
+    if frame_counter % 2 != 0:
         return frame
 
-    image = frame.to_ndarray(format="bgr24")
-    image = cv2.resize(image, (320, 240))  # Lower resolution
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = st.session_state.hands.process(image_rgb)
+    img = frame.to_ndarray(format="bgr24")
+    img = cv2.resize(img, (320, 240))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    gesture_text = ""
+    results = st.session_state.hands.process(img_rgb)
+    gesture_text = None
+
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            mp_draw.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             landmarks = [(lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark]
             gesto = detectar_gesto(landmarks)
             if gesto and gesto != last_gesture:
@@ -71,16 +87,26 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
                 last_gesture = gesto
 
     if gesture_text:
-        cv2.putText(image, gesture_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        cv2.putText(
+            img,
+            gesture_text,
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0, 255, 0),
+            3
+        )
+    # Return modified frame
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    return av.VideoFrame.from_ndarray(image, format="bgr24")
-
-# Streamlit UI
-st.title("Detector de Gestos con MQTT 🖐✊👌")
+# WebRTC streamer with STUN config and async processing
 webrtc_streamer(
     key="gesture",
     mode=WebRtcMode.SENDRECV,
     video_frame_callback=video_frame_callback,
     media_stream_constraints={"video": {"frameRate": 15}, "audio": False},
-    async_processing=False,
+    async_processing=True,
+    rtc_configuration={
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    },
 )
